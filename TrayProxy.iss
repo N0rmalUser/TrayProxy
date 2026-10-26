@@ -1,5 +1,5 @@
 #define MyAppName "TrayProxy"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "N0rmalUser"
 #define MyAppExeName "TrayProxy.exe"
 
