@@ -1,4 +1,6 @@
+using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
 using Microsoft.Win32;
 
@@ -20,30 +22,47 @@ internal sealed class ProxyApplicationContext : ApplicationContext
         @"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
     private const string ProxyEnableName = "ProxyEnable";
+    private const string ProxyServerName = "ProxyServer";
+
+    private const int ProxyPort = 3128;
+    private const int PingTimeoutMs = 800;
+
+    private const string FirstProxy = "10.10.24.1";
+    private const string SecondProxy = "10.10.7.1";
 
     private readonly NotifyIcon trayIcon;
-    private readonly ToolStripMenuItem toggleMenuItem;
+    private readonly ContextMenuStrip menu;
+
+    private readonly ToolStripMenuItem firstProxyMenuItem;
+    private readonly ToolStripMenuItem secondProxyMenuItem;
+
     private readonly Icon offIcon;
     private readonly Icon onIcon;
 
     private bool isEnabled;
     private bool isDisposed;
+    private bool isCheckingAvailability;
 
     public ProxyApplicationContext()
     {
         offIcon = CreateProxyIcon(false);
         onIcon = CreateProxyIcon(true);
 
-        toggleMenuItem = new ToolStripMenuItem();
-        toggleMenuItem.Click += (_, _) => ToggleProxy();
+        firstProxyMenuItem = new ToolStripMenuItem();
+        firstProxyMenuItem.Click += (_, _) => SelectProxy(FirstProxy);
+
+        secondProxyMenuItem = new ToolStripMenuItem();
+        secondProxyMenuItem.Click += (_, _) => SelectProxy(SecondProxy);
 
         var exitMenuItem = new ToolStripMenuItem("Выход");
         exitMenuItem.Click += (_, _) => ExitThread();
 
-        var menu = new ContextMenuStrip();
-        menu.Items.Add(toggleMenuItem);
-        menu.Items.Add(new ToolStripSeparator());
+        menu = new ContextMenuStrip();
+        menu.Items.Add(firstProxyMenuItem);
+        menu.Items.Add(secondProxyMenuItem);
         menu.Items.Add(exitMenuItem);
+
+        menu.Opening += async (_, _) => await UpdateProxyMenuAsync();
 
         trayIcon = new NotifyIcon
         {
@@ -56,12 +75,15 @@ internal sealed class ProxyApplicationContext : ApplicationContext
         trayIcon.MouseClick += OnTrayMouseClick;
 
         RefreshState();
+        RefreshSelectedProxy();
     }
 
     private void OnTrayMouseClick(object? sender, MouseEventArgs e)
     {
         if (e.Button == MouseButtons.Left)
+        {
             ToggleProxy();
+        }
     }
 
     private void ToggleProxy()
@@ -82,8 +104,8 @@ internal sealed class ProxyApplicationContext : ApplicationContext
                 return;
             }
 
-            bool currentState =
-                Convert.ToInt32(key.GetValue(ProxyEnableName, 0)) != 0;
+            bool currentState = Convert.ToInt32(
+                key.GetValue(ProxyEnableName, 0)) != 0;
 
             key.SetValue(
                 ProxyEnableName,
@@ -91,7 +113,6 @@ internal sealed class ProxyApplicationContext : ApplicationContext
                 RegistryValueKind.DWord);
 
             NotifyWindows();
-
             RefreshState();
         }
         catch (Exception ex)
@@ -104,6 +125,155 @@ internal sealed class ProxyApplicationContext : ApplicationContext
 
             RefreshState();
         }
+    }
+
+    private void SelectProxy(string address)
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(
+                RegistryPath, writable: true);
+
+            if (key is null)
+            {
+                MessageBox.Show(
+                    "Не удалось открыть настройки прокси Windows.",
+                    "TrayProxy",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+
+                return;
+            }
+
+            key.SetValue(
+                ProxyServerName,
+                $"{address}:{ProxyPort}",
+                RegistryValueKind.String);
+
+            key.SetValue(
+                ProxyEnableName,
+                1,
+                RegistryValueKind.DWord);
+
+            NotifyWindows();
+
+            RefreshState();
+            RefreshSelectedProxy();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                $"Не удалось установить прокси {address}:{ProxyPort}:\n{ex.Message}",
+                "TrayProxy",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+
+            RefreshState();
+            RefreshSelectedProxy();
+        }
+    }
+
+    private async Task UpdateProxyMenuAsync()
+    {
+        if (isCheckingAvailability || isDisposed)
+            return;
+
+        isCheckingAvailability = true;
+
+        firstProxyMenuItem.Text = $"... {FirstProxy}...";
+        secondProxyMenuItem.Text = $"... {SecondProxy}...";
+
+        RefreshSelectedProxy();
+
+        try
+        {
+            bool[] results = await Task.WhenAll(
+                PingProxyAsync(FirstProxy),
+                PingProxyAsync(SecondProxy));
+
+            if (isDisposed)
+                return;
+
+            firstProxyMenuItem.Text =
+                FormatProxyStatus(FirstProxy, results[0]);
+
+            secondProxyMenuItem.Text =
+                FormatProxyStatus(SecondProxy, results[1]);
+
+            RefreshSelectedProxy();
+        }
+        catch
+        {
+            if (!isDisposed)
+            {
+                firstProxyMenuItem.Text = FormatProxyStatus(FirstProxy, false);
+                secondProxyMenuItem.Text = FormatProxyStatus(SecondProxy, false);
+            }
+        }
+        finally
+        {
+            isCheckingAvailability = false;
+        }
+    }
+
+    private static async Task<bool> PingProxyAsync(string address)
+    {
+        try
+        {
+            using var ping = new Ping();
+
+            PingReply reply = await ping.SendPingAsync(
+                address, PingTimeoutMs);
+
+            return reply.Status == IPStatus.Success;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string FormatProxyStatus(
+        string address,
+        bool isAvailable)
+    {
+        string status = isAvailable ? "✅" : "❌";
+
+        return $"{status}  {address}:{ProxyPort}";
+    }
+
+    private void RefreshSelectedProxy()
+    {
+        string? selectedAddress = null;
+
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(RegistryPath);
+
+            string? proxyServer =
+                key?.GetValue(ProxyServerName) as string;
+
+            if (!string.IsNullOrWhiteSpace(proxyServer))
+            {
+                if (proxyServer.Contains(
+                    $"{FirstProxy}:{ProxyPort}",
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    selectedAddress = FirstProxy;
+                }
+                else if (proxyServer.Contains(
+                    $"{SecondProxy}:{ProxyPort}",
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    selectedAddress = SecondProxy;
+                }
+            }
+        }
+        catch
+        { }
+
+        firstProxyMenuItem.Checked = selectedAddress == FirstProxy;
+        secondProxyMenuItem.Checked = selectedAddress == SecondProxy;
     }
 
     private void RefreshState()
@@ -121,13 +291,7 @@ internal sealed class ProxyApplicationContext : ApplicationContext
         }
 
         trayIcon.Icon = isEnabled ? onIcon : offIcon;
-        trayIcon.Text = isEnabled
-            ? "ВКЛ"
-            : "ВЫКЛ";
-
-        toggleMenuItem.Text = isEnabled
-            ? "Выключить прокси"
-            : "Включить прокси";
+        trayIcon.Text = isEnabled ? "ВКЛ" : "ВЫКЛ";
     }
 
     private static void NotifyWindows()
@@ -205,6 +369,8 @@ internal sealed class ProxyApplicationContext : ApplicationContext
 
             trayIcon.Visible = false;
             trayIcon.Dispose();
+
+            menu.Dispose();
 
             offIcon.Dispose();
             onIcon.Dispose();
